@@ -3,12 +3,9 @@ document.addEventListener('DOMContentLoaded', function() {
     chrome.storage.sync.get([
         'groqApiKey',
         'groqModel',
-        // 'keywords', // Added to be retrieved
-        // 'minDelay', // Added to be retrieved
-        // 'maxDelay', // Added to be retrieved
         'enableLiking',
         'enableCommenting',
-        'automationEnabled'
+        'automationEnabled',
     ], function(items) {
         // Set values for input fields, using saved settings or defaults
         document.getElementById('groqApiKey').value = items.groqApiKey || '';

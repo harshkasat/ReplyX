@@ -1,8 +1,11 @@
-// background.js
+// background.js - OPTIMIZED VERSION
 
-// Store active tab state
+// Store active tab state and API cache
 let activeTabId = null;
 let isRunning = false;
+let apiCache = new Map(); // Cache API responses for similar tweets
+let rateLimitQueue = []; // Queue for API requests
+let isProcessingQueue = false;
 
 // Listen for messages from popup and content script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -11,229 +14,285 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             handleSettingsUpdate(message.settings);
             break;
         case 'groqApiRequest':
-            handleGroqApiRequest(message.data, sender.tab.id);
+            // Handle async but respond immediately
+            handleGroqApiRequestFast(message.data, sender.tab.id);
+            sendResponse({status: 'queued'}); // Immediate response
             break;
         case 'ping':
             sendResponse({status: 'alive'});
             break;
     }
+    return true; // Keep message channel open for async responses
 });
 
-// Handle settings updates
+// FASTER settings update - no unnecessary delays
 async function handleSettingsUpdate(settings) {
     console.log('Handling settings update:', settings);
     
-    // Store settings for future reference
+    // Store settings
     await chrome.storage.local.set({ currentSettings: settings });
     
     try {
-        // Get all Twitter/X tabs
         const tabs = await chrome.tabs.query({
             url: ["*://*.twitter.com/*", "*://*.x.com/*"]
         });
 
-        console.log(`Found ${tabs.length} Twitter/X tabs`);
-
-        // Inject content script if needed and send settings to each tab
-        for (const tab of tabs) {
+        // Process tabs in parallel instead of sequentially
+        const promises = tabs.map(async (tab) => {
             try {
-                // Try to send message first
                 await chrome.tabs.sendMessage(tab.id, {
                     type: 'settingsUpdated',
                     settings: settings
                 });
-                console.log(`Settings sent to tab ${tab.id}`);
             } catch (error) {
-                // If sending failed, inject content script and try again
-                console.log('Injecting content script into tab:', tab.id);
+                // Inject and retry without waiting
                 try {
                     await chrome.scripting.executeScript({
                         target: { tabId: tab.id },
                         files: ['content_script.js']
                     });
                     
-                    // Wait a bit for script to load
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                    
-                    // Try sending message again after injection
-                    await chrome.tabs.sendMessage(tab.id, {
-                        type: 'settingsUpdated',
-                        settings: settings
-                    });
-                    console.log(`Content script injected and settings sent to tab ${tab.id}`);
+                    // Don't wait - send message immediately
+                    setTimeout(async () => {
+                        try {
+                            await chrome.tabs.sendMessage(tab.id, {
+                                type: 'settingsUpdated',
+                                settings: settings
+                            });
+                        } catch (e) {
+                            console.log(`Tab ${tab.id} might be closed`);
+                        }
+                    }, 500); // Reduced wait time
                 } catch (injectionError) {
-                    console.error(`Failed to inject script into tab ${tab.id}:`, injectionError);
+                    console.log(`Tab ${tab.id} injection failed - tab might be closed`);
                 }
             }
-        }
+        });
+        
+        // Don't wait for all promises to resolve
+        Promise.allSettled(promises);
+        
     } catch (error) {
         console.error('Error handling settings update:', error);
     }
 }
 
-// Handle Groq API requests - FIXED VERSION
-async function handleGroqApiRequest(data, tabId) {
-    console.log('Handling Groq API request:', data);
+// MUCH FASTER API handling with caching and queue
+async function handleGroqApiRequestFast(data, tabId) {
+    console.log('Received fast API request');
+    
+    // Check cache first for instant responses
+    const cacheKey = data.prompt.toLowerCase().substring(0, 50);
+    if (apiCache.has(cacheKey)) {
+        console.log('Using cached response');
+        chrome.tabs.sendMessage(tabId, {
+            type: 'groqApiResponse',
+            data: apiCache.get(cacheKey)
+        });
+        return;
+    }
+    
+    // Add to queue for processing
+    rateLimitQueue.push({ data, tabId, timestamp: Date.now() });
+    
+    // Process queue if not already processing
+    if (!isProcessingQueue) {
+        processApiQueue();
+    }
+}
+
+// Process API requests in background queue
+async function processApiQueue() {
+    if (isProcessingQueue || rateLimitQueue.length === 0) return;
+    
+    isProcessingQueue = true;
+    
+    while (rateLimitQueue.length > 0) {
+        const request = rateLimitQueue.shift();
+        
+        // Skip old requests (older than 30 seconds)
+        if (Date.now() - request.timestamp > 30000) {
+            console.log('Skipping old request');
+            continue;
+        }
+        
+        await processApiRequest(request);
+        
+        // Small delay to respect rate limits
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    isProcessingQueue = false;
+}
+
+// Optimized API request processing
+async function processApiRequest({ data, tabId }) {
+    // Shorter, faster prompt
+    const quickPrompt = `Reply to: "${data.prompt}" sounds like a casual conversation, with human-like imperfections. 
+    Use short sentences, include some grammatical mistakes, and avoid over-polishing the text. Keep it punchy, natural, and easy to read. 
+    The tone should feel conversational, not overly formal. Don't add too much grammar structure, just make it feel like a regular tweet from a person. 
+    Keep it short like 8-11 words.  Add some grammar mistakes, don't over-polish. Sound human not like a bot or brand`;
     
     try {
         const settings = await chrome.storage.sync.get(['groqApiKey', 'groqModel']);
         
         if (!settings.groqApiKey) {
-            console.error('No Groq API key found');
-            chrome.tabs.sendMessage(tabId, {
-                type: 'groqApiError',
-                error: 'No API key configured'
-            });
+            sendFallbackResponse(tabId);
             return;
         }
 
-        console.log('Making request to Groq API...');
-        
-        const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${settings.groqApiKey}`
-            },
-            body: JSON.stringify({
-                model: settings.groqModel || "llama3-8b-8192", // Use a more reliable model
-                messages: [{
-                    role: 'user',
-                    content: data.prompt
-                }],
-                max_tokens: 100, // Shorter responses for tweets
-                temperature: 0.8, // More creative responses
-                top_p: 0.9,
-                frequency_penalty: 0.5, // Reduce repetition
-                presence_penalty: 0.3
-            })
-        });
+        // Faster API call with reduced parameters
+        const response = await Promise.race([
+            fetch('https://api.groq.com/openai/v1/chat/completions', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${settings.groqApiKey}`
+                },
+                body: JSON.stringify({
+                    model: "llama3-8b-8192",
+                    messages: [{ role: 'user', content: quickPrompt }],
+                    max_tokens: 50, // Smaller for speed
+                    temperature: 0.9,
+                    stream: false // Ensure no streaming
+                })
+            }),
+            // 5 second timeout
+            new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('API timeout')), 5000)
+            )
+        ]);
 
         if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Groq API response not ok:', response.status, errorText);
-            throw new Error(`API request failed: ${response.status} ${errorText}`);
+            throw new Error(`API error: ${response.status}`);
         }
 
         const result = await response.json();
-        console.log('Groq API response:', result);
         
-        if (!result.choices || !result.choices[0] || !result.choices[0].message) {
-            throw new Error('Invalid response format from Groq API');
-        }
-        
-        // Clean the response text
-        let cleanResponse = result.choices[0].message.content
-            .replace(/[^\x00-\x7F]/g, "") // Remove non-ASCII characters
-            .replace(/"/g, '') // Remove quotes
-            .replace(/\n/g, ' ') // Replace newlines with spaces
-            .trim();
+        if (result.choices?.[0]?.message?.content) {
+            let cleanResponse = result.choices[0].message.content
+                .replace(/[^\x00-\x7F]/g, "")
+                .replace(/"/g, '')
+                .replace(/\n/g, ' ')
+                .trim();
+                
+            if (cleanResponse.length > 150) {
+                cleanResponse = cleanResponse.substring(0, 147) + "...";
+            }
             
-        // Ensure response isn't too long for Twitter
-        if (cleanResponse.length > 200) {
-            cleanResponse = cleanResponse.substring(0, 197) + "...";
+            if (!cleanResponse || cleanResponse.length < 3) {
+                cleanResponse = getRandomFallback();
+            }
+            
+            // Cache the response
+            const cacheKey = data.prompt.toLowerCase().substring(0, 50);
+            apiCache.set(cacheKey, cleanResponse);
+            
+            // Clean cache if it gets too big
+            if (apiCache.size > 100) {
+                const firstKey = apiCache.keys().next().value;
+                apiCache.delete(firstKey);
+            }
+            
+            // Send response
+            chrome.tabs.sendMessage(tabId, {
+                type: 'groqApiResponse',
+                data: cleanResponse
+            }).catch(e => console.log('Tab closed before response'));
+            
+        } else {
+            throw new Error('Invalid API response');
         }
-        
-        // Make sure it's not empty
-        if (!cleanResponse || cleanResponse.length < 3) {
-            cleanResponse = "Interesting point! 👍";
-        }
-        
-        console.log('Sending cleaned response to tab:', cleanResponse);
-        
-        // Send response back to content script
-        chrome.tabs.sendMessage(tabId, {
-            type: 'groqApiResponse',
-            data: cleanResponse
-        });
         
     } catch (error) {
-        console.error('Error calling Groq API:', error);
-        
-        // Send fallback response
-        const fallbackResponses = [
-            "Great point! 👍",
-            "Interesting perspective!",
-            "Thanks for sharing this!",
-            "Really insightful!",
-            "I agree with this!",
-            "Well said!",
-            "This is so true!",
-            "Exactly my thoughts!",
-            "Love this take!",
-            "Couldn't agree more!"
-        ];
-        
-        const randomResponse = fallbackResponses[Math.floor(Math.random() * fallbackResponses.length)];
-        
-        chrome.tabs.sendMessage(tabId, {
-            type: 'groqApiResponse',
-            data: randomResponse
-        });
+        console.log('API error, using fallback:', error.message);
+        sendFallbackResponse(tabId);
     }
 }
 
-// Track tab updates and ensure content script is loaded
+// Fast fallback response
+function sendFallbackResponse(tabId) {
+    const response = getRandomFallback();
+    chrome.tabs.sendMessage(tabId, {
+        type: 'groqApiResponse',
+        data: response
+    }).catch(e => console.log('Tab closed'));
+}
+
+function getRandomFallback() {
+    const responses = [
+        "So true! 💯", "This! 👆", "Exactly!", "Facts 🔥", 
+        "Love this take", "Well said!", "This hits different",
+        "Big mood", "Couldn't agree more", "This is it!"
+    ];
+    return responses[Math.floor(Math.random() * responses.length)];
+}
+
+// FASTER tab handling - no unnecessary waits
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     if (changeInfo.status === 'complete' && 
         (tab.url?.includes('twitter.com') || tab.url?.includes('x.com'))) {
         
-        console.log('Tab updated, checking content script:', tabId);
-        
-        try {
-            // Try to send a ping message to check if content script is loaded
-            await chrome.tabs.sendMessage(tabId, { type: 'ping' });
-            console.log('Content script already loaded on tab:', tabId);
-        } catch (error) {
-            // If content script isn't loaded, inject it
-            console.log('Content script not found, injecting into tab:', tabId);
+        // Don't wait - inject immediately in background
+        setTimeout(async () => {
             try {
-                await chrome.scripting.executeScript({
-                    target: { tabId: tabId },
-                    files: ['content_script.js']
-                });
-                
-                console.log('Content script injected successfully');
-                
-                // Wait for script to initialize
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                
-                // Send current settings if available
-                const settings = await chrome.storage.local.get('currentSettings');
-                if (settings.currentSettings) {
-                    await chrome.tabs.sendMessage(tabId, {
-                        type: 'settingsUpdated',
-                        settings: settings.currentSettings
+                await chrome.tabs.sendMessage(tabId, { type: 'ping' });
+            } catch (error) {
+                try {
+                    await chrome.scripting.executeScript({
+                        target: { tabId: tabId },
+                        files: ['content_script.js']
                     });
-                    console.log('Settings sent to newly injected script');
+                    
+                    // Send settings without waiting
+                    setTimeout(async () => {
+                        const settings = await chrome.storage.local.get('currentSettings');
+                        if (settings.currentSettings) {
+                            chrome.tabs.sendMessage(tabId, {
+                                type: 'settingsUpdated',
+                                settings: settings.currentSettings
+                            }).catch(() => {});
+                        }
+                    }, 300);
+                } catch (e) {
+                    console.log('Injection failed - tab closed or restricted');
                 }
-            } catch (injectionError) {
-                console.error('Error injecting content script:', injectionError);
             }
-        }
+        }, 100); // Minimal delay
     }
 });
 
-// Track active tab for other purposes
-chrome.tabs.onActivated.addListener((activeInfo) => {
-    activeTabId = activeInfo.tabId;
-    console.log('Active tab changed to:', activeTabId);
+// Keep extension alive in background
+chrome.runtime.onStartup.addListener(() => {
+    console.log('Extension keeping alive');
+    keepAlive();
 });
 
-// Clean up when tab is closed
+chrome.runtime.onInstalled.addListener(() => {
+    console.log('Extension installed - starting background mode');
+    keepAlive();
+});
+
+// Keep service worker alive
+function keepAlive() {
+    setInterval(() => {
+        chrome.storage.local.get('heartbeat').then(() => {
+            chrome.storage.local.set({ heartbeat: Date.now() });
+        });
+    }, 25000); // Every 25 seconds to prevent service worker sleep
+}
+
+// Track active tab
+chrome.tabs.onActivated.addListener((activeInfo) => {
+    activeTabId = activeInfo.tabId;
+});
+
+// Clean up closed tabs
 chrome.tabs.onRemoved.addListener((tabId) => {
     if (tabId === activeTabId) {
         activeTabId = null;
-        console.log('Active tab closed');
     }
 });
 
-// Handle extension startup
-chrome.runtime.onStartup.addListener(() => {
-    console.log('Extension started up');
-});
-
-// Handle extension installation
-chrome.runtime.onInstalled.addListener(() => {
-    console.log('Extension installed/updated');
-});
+// Initialize keep alive
+keepAlive();
