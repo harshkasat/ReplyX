@@ -2,12 +2,8 @@
   "manifest_version": 3,
   "name": "ReplyX",
   "version": "1.0",
-  "description": "Automates X (Twitter) engagement with human-like interactions and AI-generated replies",  "permissions": [
-    "activeTab",
-    "storage",
-    "scripting",
-    "tabs"
-  ],
+  "description": "Automates X (Twitter) engagement with human-like interactions and AI-generated replies",
+  "permissions": ["activeTab", "storage", "scripting", "tabs"],
   "host_permissions": [
     "https://twitter.com/*",
     "https://x.com/*",
@@ -27,10 +23,5 @@
       "run_at": "document_idle"
     }
   ],
-  "permissions": [
-    "storage",
-    "tabs",
-    "scripting",
-    "background"
-  ]
+  "permissions": ["storage", "tabs", "scripting", "background"]
 }
